@@ -11,6 +11,7 @@ import time
 import cv2
 from typing import Optional
 from collections import deque
+import tqdm
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -62,12 +63,13 @@ class RPSBattleEnv(MultiAgentEnv):
     }
     
     # Action constants
-    LEFT, UP, RIGHT, DOWN = 0, 1, 2, 3
+    LEFT, UP, RIGHT, DOWN, STAY = 0, 1, 2, 3, 4
     ACTION_DELTAS = {
         LEFT: (-1, 0),
         UP: (0, -1),
         RIGHT: (1, 0),
-        DOWN: (0, 1)
+        DOWN: (0, 1),
+        STAY: (0, 0),
     }
     
     def __init__(self, config: dict):
@@ -85,8 +87,8 @@ class RPSBattleEnv(MultiAgentEnv):
         # Define action and observation spaces
         self._agent_ids = [f"agent_{i}" for i in range(self.agents_per_team * 3)]
         
-        # Action space: Discrete 4 directions (LEFT, UP, RIGHT, DOWN)
-        self.action_space = spaces.Discrete(4)
+        # Action space: Discrete 5 directions (LEFT, UP, RIGHT, DOWN, STAY)
+        self.action_space = spaces.Discrete(5)
         
         # Observation space: [own_x, own_y, own_team] + [other_x, other_y, other_team] * max_other_agents
         max_other_agents = len(self._agent_ids) - 1
@@ -94,6 +96,8 @@ class RPSBattleEnv(MultiAgentEnv):
         self.observation_space = spaces.Box(
             low=-2.0, high=2.0, shape=(obs_dim,), dtype=np.float32
         )
+
+        self.prev_team_counts = None
         
         self.reset()
     
@@ -196,9 +200,10 @@ class RPSBattleEnv(MultiAgentEnv):
                     new_y = agent.y + dy
                     
                     # Apply boundary conditions (can't move outside grid)
-                    if 0 <= new_x < self.grid_size and 0 <= new_y < self.grid_size:
-                        agent.x = new_x
-                        agent.y = new_y
+                    if dx != 0 or dy != 0:  # Only check bounds for movement
+                        if 0 <= new_x < self.grid_size and 0 <= new_y < self.grid_size:
+                            agent.x = new_x
+                            agent.y = new_y
             
             # Update conversion timer
             if agent.conversion_timer > 0:
@@ -209,6 +214,9 @@ class RPSBattleEnv(MultiAgentEnv):
         
         # Check collisions and conversions
         self._handle_collisions(rewards)
+
+        # UPD1!
+        updated_agent_teams = {agent_id: agent.team for agent_id, agent in self.agents.items()}
         
         # Calculate team-based rewards
         team_counts = self._count_teams()
@@ -217,20 +225,38 @@ class RPSBattleEnv(MultiAgentEnv):
         if total_agents > 0:
             for agent_id, agent in self.agents.items():
                 # Reward for team dominance
-                rewards[agent_id] += team_counts[agent.team] / total_agents
+                rewards[agent_id] += 0.03 * (team_counts[agent.team] / total_agents)
                 
                 # Small penalty for being far from teammates
                 teammate_distance = self._avg_teammate_distance(agent)
                 if teammate_distance > 0:
-                    rewards[agent_id] -= 0.002 * teammate_distance / self.grid_size
+                    rewards[agent_id] -= 0.01 * teammate_distance / self.grid_size
                 
                 # Interaction incentive - reward for being near enemies
                 enemy_proximity = self._calculate_enemy_proximity(agent)
-                rewards[agent_id] += 0.02 / (enemy_proximity / self.grid_size + 0.1)
+
+                # UPD2!
+                rewards[agent_id] += 0.07 / (enemy_proximity / self.grid_size + 0.1)
                 
                 # Contested area bonus - reward for being in mixed team areas
                 contested_area_bonus = self._calculate_contested_area_bonus(agent)
-                rewards[agent_id] += contested_area_bonus * 0.1
+                rewards[agent_id] += contested_area_bonus * 0.05
+
+        # ----------------- Team Growth Reward ---------------------
+        team_counts = self._count_teams()
+        total_agents = sum(team_counts.values())
+        
+        if self.prev_team_counts is not None and total_agents > 0:
+            for agent_id, agent in self.agents.items():
+                # Reward based on team growth
+                growth = team_counts[agent.team] - self.prev_team_counts.get(agent.team, 0)
+                if growth > 0:
+                    rewards[agent_id] += 0.5 * growth  # Reward for each new team member
+        
+        # Update previous counts
+        self.prev_team_counts = team_counts.copy()
+
+        # -----------------------------------------------------------
         
         # Check termination conditions
         terminated = {}
@@ -255,7 +281,7 @@ class RPSBattleEnv(MultiAgentEnv):
         terminated["__all__"] = episode_done
         truncated["__all__"] = False
         
-        return self._get_observations(), rewards, terminated, truncated, {}
+        return self._get_observations(), rewards, terminated, truncated, {"agent_teams": updated_agent_teams}
     
     def _handle_collisions(self, rewards: Dict[str, float]):
         """Handle agent collisions and team conversions"""
@@ -372,7 +398,7 @@ class CustomPPOModel(TorchModelV2, nn.Module):
             prev_size = size
         
         self.base_model = nn.Sequential(*layers)
-        self.policy_head = nn.Linear(prev_size, num_outputs)  # num_outputs = 4 for discrete actions
+        self.policy_head = nn.Linear(prev_size, num_outputs)  # num_outputs = 5 for discrete actions
         self.value_head = nn.Linear(prev_size, 1)
         
         self._value_out = None
@@ -430,7 +456,7 @@ def train_agents(args):
             gamma=0.99,
             lambda_=0.95,
             clip_param=0.2,
-            entropy_coeff=0.01,
+            entropy_coeff=0.02,
             model={
                 "custom_model": "custom_ppo",
                 "fcnet_hiddens": [256, 256],
@@ -795,6 +821,7 @@ class PygameVisualizer:
 
 def inference_mode(args):
     """Inference mode: Load checkpoint and run with Pygame visualization or video recording"""
+    from tqdm import tqdm
     print("Starting inference mode...")
     
     # Load checkpoint
@@ -866,6 +893,10 @@ def inference_mode(args):
         else:
             print(f"Recording {max_episodes} episode(s) to video...")
         
+        # Initialize tqdm progress bar for total steps across all episodes
+        total_steps = args.max_steps * max_episodes
+        progress_bar = tqdm(total=total_steps, desc="Simulation Progress", unit="step")
+        
         while running and episode_count < max_episodes:
             # Handle events
             running = visualizer.handle_events()
@@ -885,6 +916,7 @@ def inference_mode(args):
                 # Step environment
                 obs, rewards, terminated, truncated, info = env.step(actions)
                 step_count += 1
+                progress_bar.update(1)  # Update progress bar
                 
                 # Check for episode end
                 if terminated.get("__all__", False):
@@ -911,6 +943,7 @@ def inference_mode(args):
                 time.sleep(1.0 / args.video_fps)
         
         # Clean up
+        progress_bar.close()
         visualizer.close()
         print("Inference mode ended.")
         
@@ -1015,7 +1048,7 @@ def parse_arguments():
     parser.add_argument(
         "--video-width", 
         type=int, 
-        default=800,
+        default=1200,
         help="Video width in pixels"
     )
     parser.add_argument(
