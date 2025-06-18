@@ -208,10 +208,18 @@ class RPSBattleEnv(MultiAgentEnv):
                 # Reward for team dominance
                 rewards[agent_id] += team_counts[agent.team] / total_agents
                 
-                # Small penalty for being far from teammates
+                # Small penalty for being far from teammates (you already reduced this)
                 teammate_distance = self._avg_teammate_distance(agent)
                 if teammate_distance > 0:
-                    rewards[agent_id] -= 0.01 * teammate_distance / self.grid_size
+                    rewards[agent_id] -= 0.002 * teammate_distance / self.grid_size  # Reduced from 0.01
+                
+                # NEW: Interaction incentive - reward for being near enemies
+                enemy_proximity = self._calculate_enemy_proximity(agent)
+                rewards[agent_id] += 0.02 / (enemy_proximity / self.grid_size + 0.1)  # Normalized
+                
+                # NEW: Contested area bonus - reward for being in mixed team areas
+                contested_area_bonus = self._calculate_contested_area_bonus(agent)
+                rewards[agent_id] += contested_area_bonus * 0.1
         
         # Check termination conditions
         terminated = {}
@@ -291,7 +299,47 @@ class RPSBattleEnv(MultiAgentEnv):
                 except (ValueError, FloatingPointError):
                     continue
         return np.mean(distances) if distances else 0.0
-    
+
+    def _calculate_enemy_proximity(self, agent: AgentState) -> float:
+        """Calculate average distance to nearest enemies (lower = closer)"""
+        enemy_distances = []
+        
+        for other in self.agents.values():
+            if other.agent_id != agent.agent_id and other.team != agent.team:
+                try:
+                    dist = np.sqrt((agent.x - other.x)**2 + (agent.y - other.y)**2)
+                    enemy_distances.append(dist)
+                except (ValueError, FloatingPointError):
+                    continue
+        
+        if not enemy_distances:
+            return self.grid_size  # Max distance if no enemies
+        
+        # Return average distance to closest 3 enemies (or all if fewer than 3)
+        closest_enemies = sorted(enemy_distances)[:3]
+        return np.mean(closest_enemies)
+
+    def _calculate_contested_area_bonus(self, agent: AgentState, radius: float = 15.0) -> float:
+        """Calculate bonus for being in areas with multiple teams nearby"""
+        teams_nearby = set()
+        agents_in_radius = 0
+        
+        for other in self.agents.values():
+            if other.agent_id != agent.agent_id:
+                try:
+                    dist = np.sqrt((agent.x - other.x)**2 + (agent.y - other.y)**2)
+                    if dist <= radius:
+                        teams_nearby.add(other.team)
+                        agents_in_radius += 1
+                except (ValueError, FloatingPointError):
+                    continue
+        
+        # Bonus increases with number of different teams nearby
+        team_diversity = len(teams_nearby)
+        density_factor = min(agents_in_radius / 5.0, 1.0)  # Cap at 5 agents
+        
+        return team_diversity * density_factor
+        
     def render(self):
         """Render is handled separately in inference mode"""
         pass
