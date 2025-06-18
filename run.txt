@@ -1,0 +1,1 @@
+python3 marl_grid.py --mode train --agents-per-team 8 --training-iterations 1000 --num-workers 12 --use-wandb --wandb-project "rock-paper-scissors-rl" --grid-size 20
