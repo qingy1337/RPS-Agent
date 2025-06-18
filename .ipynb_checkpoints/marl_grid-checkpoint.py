@@ -139,7 +139,7 @@ class RPSBattleEnv(MultiAgentEnv):
                 )
                 agent_teams[agent_id] = team
         
-        return self._get_observations(), {"agent_teams": agent_teams}
+        return self._get_observations(), {"__common__": {"agent_teams": agent_teams}}
     
     def _get_observations(self) -> Dict[str, np.ndarray]:
         """Get observations for all agents"""
@@ -281,7 +281,7 @@ class RPSBattleEnv(MultiAgentEnv):
         terminated["__all__"] = episode_done
         truncated["__all__"] = False
         
-        return self._get_observations(), rewards, terminated, truncated, {"agent_teams": updated_agent_teams}
+        return self._get_observations(), rewards, terminated, truncated, {"__common__": {"agent_teams": updated_agent_teams}}
     
     def _handle_collisions(self, rewards: Dict[str, float]):
         """Handle agent collisions and team conversions"""
