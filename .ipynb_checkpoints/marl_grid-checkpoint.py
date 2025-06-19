@@ -76,7 +76,7 @@ class RPSBattleEnv(MultiAgentEnv):
         super().__init__()
         
         # Environment parameters
-        self.grid_size = config.get("grid_size", 20)  # Now represents grid dimensions (20x20)
+        self.grid_size = config.get("grid_size", 20)
         self.agents_per_team = config.get("agents_per_team", 10)
         self.max_steps = config.get("max_steps", 1000)
         
@@ -84,20 +84,17 @@ class RPSBattleEnv(MultiAgentEnv):
         self.agents: Dict[str, AgentState] = {}
         self.step_count = 0
         
+        # --- NEW: Track conversion locations for participation rewards ---
+        self.recent_conversions = [] 
+        
         # Define action and observation spaces
         self._agent_ids = [f"agent_{i}" for i in range(self.agents_per_team * 3)]
-        
-        # Action space: Discrete 5 directions (LEFT, UP, RIGHT, DOWN, STAY)
         self.action_space = spaces.Discrete(5)
-        
-        # Observation space: [own_x, own_y, own_team] + [other_x, other_y, other_team] * max_other_agents
         max_other_agents = len(self._agent_ids) - 1
         obs_dim = 3 + max_other_agents * 3
         self.observation_space = spaces.Box(
             low=-2.0, high=2.0, shape=(obs_dim,), dtype=np.float32
         )
-
-        self.prev_team_counts = None
         
         self.reset()
     
@@ -109,30 +106,21 @@ class RPSBattleEnv(MultiAgentEnv):
         self.step_count = 0
         self.agents.clear()
         
-        # Store agent teams for policy mapping
-        agent_teams = {}
+        # --- NEW: Clear conversion history on reset ---
+        self.recent_conversions.clear()
         
-        # Keep track of occupied positions to avoid overlap
+        agent_teams = {}
         occupied_positions = set()
         
-        # Initialize agents for each team
+        # Initialize agents
         for team in range(3):
             for i in range(self.agents_per_team):
                 agent_id = f"agent_{team * self.agents_per_team + i}"
+                x = np.random.randint(0, self.grid_size)
+                y = np.random.randint(0, self.grid_size)
                 
-                # Find unoccupied random position
-                max_attempts = 100
-                for _ in range(max_attempts):
-                    x = np.random.randint(0, self.grid_size)
-                    y = np.random.randint(0, self.grid_size)
-                    
-                    if (x, y) not in occupied_positions:
-                        occupied_positions.add((x, y))
-                        break
-                else:
-                    # If we can't find an unoccupied position, place randomly anyway
-                    x = np.random.randint(0, self.grid_size)
-                    y = np.random.randint(0, self.grid_size)
+                if (x, y) not in occupied_positions:
+                    occupied_positions.add((x, y))
                 
                 self.agents[agent_id] = AgentState(
                     x=x, y=y, team=team, agent_id=agent_id
@@ -142,21 +130,15 @@ class RPSBattleEnv(MultiAgentEnv):
         return self._get_observations(), {"__common__": {"agent_teams": agent_teams}}
     
     def _get_observations(self) -> Dict[str, np.ndarray]:
-        """Get observations for all agents"""
+        """Get observations for all agents (unchanged)"""
         obs = {}
-        
-        # Get list of all agents (for consistent ordering)
         all_agents = [(aid, agent) for aid, agent in self.agents.items()]
-        
         for agent_id, agent in all_agents:
-            # Own state (normalized to [-1, 1] range)
             agent_obs = [
-                np.clip((agent.x / (self.grid_size - 1)) * 2 - 1, -1, 1),  # x position
-                np.clip((agent.y / (self.grid_size - 1)) * 2 - 1, -1, 1),  # y position
-                np.clip((agent.team / 2.0) * 2 - 1, -1, 1)  # team
+                np.clip((agent.x / (self.grid_size - 1)) * 2 - 1, -1, 1),
+                np.clip((agent.y / (self.grid_size - 1)) * 2 - 1, -1, 1),
+                np.clip((agent.team / 2.0) * 2 - 1, -1, 1)
             ]
-            
-            # Other agents' states (fixed order)
             for other_id, other in all_agents:
                 if other_id != agent_id:
                     agent_obs.extend([
@@ -164,104 +146,73 @@ class RPSBattleEnv(MultiAgentEnv):
                         np.clip((other.y / (self.grid_size - 1)) * 2 - 1, -1, 1),
                         np.clip((other.team / 2.0) * 2 - 1, -1, 1)
                     ])
-            
-            # Pad to fixed size
             while len(agent_obs) < self.observation_space.shape[0]:
                 agent_obs.extend([-2.0, -2.0, -2.0])
-            
-            # Truncate to exact size and ensure correct dtype
             obs_array = np.array(agent_obs[:self.observation_space.shape[0]], dtype=np.float32)
             obs_array = np.clip(obs_array, -2.0, 2.0)
             obs[agent_id] = obs_array
-        
         return obs
     
     def step(self, actions: Dict[str, np.ndarray]):
         """Execute one environment step"""
         self.step_count += 1
         
-        # Update agent positions based on actions
+        # Update agent positions
         for agent_id, action in actions.items():
             if agent_id in self.agents:
                 agent = self.agents[agent_id]
-                
-                # Convert action to integer if needed
-                if isinstance(action, (np.ndarray, list)):
-                    action = int(action[0]) if len(action) > 0 else 0
-                else:
-                    action = int(action)
-                
-                # Get movement delta
+                action = int(action)
                 if action in self.ACTION_DELTAS:
                     dx, dy = self.ACTION_DELTAS[action]
-                    
-                    # Calculate new position
                     new_x = agent.x + dx
                     new_y = agent.y + dy
-                    
-                    # Apply boundary conditions (can't move outside grid)
-                    if dx != 0 or dy != 0:  # Only check bounds for movement
-                        if 0 <= new_x < self.grid_size and 0 <= new_y < self.grid_size:
-                            agent.x = new_x
-                            agent.y = new_y
-            
-            # Update conversion timer
+                    if 0 <= new_x < self.grid_size and 0 <= new_y < self.grid_size:
+                        agent.x = new_x
+                        agent.y = new_y
             if agent.conversion_timer > 0:
-                agent.conversion_timer -= 0.1  # Fixed time step for discrete environment
+                agent.conversion_timer -= 0.1
         
-        # Initialize rewards for all agents
         rewards = {agent_id: 0.0 for agent_id in self.agents.keys()}
         
-        # Check collisions and conversions (this handles conversion penalties)
+        # --- MODIFIED: This now records conversion locations ---
         self._handle_collisions(rewards)
         
-        # UPD1!
-        updated_agent_teams = {agent_id: agent.team for agent_id, agent in self.agents.items()}
-        
-        # Team Growth Reward - reward for converting someone to your team
-        team_counts = self._count_teams()
-        total_agents = sum(team_counts.values())
-        
-        if self.prev_team_counts is not None and total_agents > 0:
+        # --- NEW: Calculate and add participation rewards ---
+        if self.recent_conversions: # Only do this if conversions actually happened
             for agent_id, agent in self.agents.items():
-                # Reward based on team growth
-                growth = team_counts[agent.team] - self.prev_team_counts.get(agent.team, 0)
-                if growth > 0:
-                    rewards[agent_id] += 0.5 * growth  # Reward for each new team member
+                participation_reward = self._calculate_participation_reward(agent)
+                # This reward is given to all agents on the winning team of a conversion
+                # if they are close enough to the action.
+                if agent.team == self.agents[self.recent_conversions[0]['winner_id']].team:
+                    rewards[agent_id] += participation_reward
         
-        # Update previous counts
-        self.prev_team_counts = team_counts.copy()
-
-        # -----------------------------------------------------------
+        updated_agent_teams = {aid: agent.team for aid, agent in self.agents.items()}
         
         # Check termination conditions
-        terminated = {}
-        truncated = {}
-        
-        # Check if episode should end
+        terminated = {"__all__": False}
+        truncated = {"__all__": False}
         episode_done = self.step_count >= self.max_steps
         winning_team = self._check_victory()
         
-        if winning_team is not None:
+        if winning_team is not None or episode_done:
             episode_done = True
-            # Bonus for winning team
-            for agent_id, agent in self.agents.items():
-                if agent.team == winning_team:
-                    rewards[agent_id] += 10.0
+            if winning_team is not None:
+                for agent_id, agent in self.agents.items():
+                    if agent.team == winning_team:
+                        rewards[agent_id] += 10.0 # Large bonus for winning
         
-        # Set termination flags for all agents
         for agent_id in self.agents.keys():
             terminated[agent_id] = episode_done
             truncated[agent_id] = False
-        
         terminated["__all__"] = episode_done
-        truncated["__all__"] = False
         
         return self._get_observations(), rewards, terminated, truncated, {"__common__": {"agent_teams": updated_agent_teams}}
     
     def _handle_collisions(self, rewards: Dict[str, float]):
-        """Handle agent collisions and team conversions"""
-        # Group agents by position
+        """Handle agent collisions, team conversions, and record conversion events."""
+        # --- NEW: Clear conversion list from the previous step ---
+        self.recent_conversions.clear()
+        
         position_groups = {}
         for agent in self.agents.values():
             pos = (agent.x, agent.y)
@@ -269,91 +220,71 @@ class RPSBattleEnv(MultiAgentEnv):
                 position_groups[pos] = []
             position_groups[pos].append(agent)
         
-        # Handle collisions for each position with multiple agents
         for pos, agents_at_pos in position_groups.items():
             if len(agents_at_pos) > 1:
-                # Handle all pairwise interactions at this position
                 for i, agent1 in enumerate(agents_at_pos):
                     for agent2 in agents_at_pos[i+1:]:
                         if agent1.team != agent2.team:
-                            # Rock beats Scissors, Scissors beats Paper, Paper beats Rock
+                            winner, loser = None, None
                             if (agent1.team == self.ROCK and agent2.team == self.SCISSORS) or \
                                (agent1.team == self.SCISSORS and agent2.team == self.PAPER) or \
                                (agent1.team == self.PAPER and agent2.team == self.ROCK):
-                                # Agent1 wins
-                                agent2.team = agent1.team
-                                agent2.conversion_timer = 1.0
-                                rewards[agent1.agent_id] += 1.0
-                                rewards[agent2.agent_id] -= 0.5
+                                winner, loser = agent1, agent2
                             else:
-                                # Agent2 wins
-                                agent1.team = agent2.team
-                                agent1.conversion_timer = 1.0
-                                rewards[agent2.agent_id] += 1.0
-                                rewards[agent1.agent_id] -= 0.5
+                                winner, loser = agent2, agent1
+                            
+                            # --- MODIFIED: Process conversion and record it ---
+                            loser.team = winner.team
+                            loser.conversion_timer = 1.0
+                            rewards[winner.agent_id] += 1.0  # Direct reward for conversion
+                            rewards[loser.agent_id] -= 0.9   # Penalty for being converted
+
+                            # --- NEW: Record the conversion event ---
+                            self.recent_conversions.append({
+                                'pos': pos, 
+                                'winner_id': winner.agent_id
+                            })
     
     def _count_teams(self) -> Dict[int, int]:
-        """Count agents per team"""
+        """Count agents per team (unchanged)"""
         counts = {0: 0, 1: 0, 2: 0}
         for agent in self.agents.values():
             counts[agent.team] += 1
         return counts
     
     def _check_victory(self) -> Optional[int]:
-        """Check if one team has won"""
+        """Check if one team has won (unchanged)"""
         counts = self._count_teams()
         alive_teams = [team for team, count in counts.items() if count > 0]
         return alive_teams[0] if len(alive_teams) == 1 else None
     
-    def _avg_teammate_distance(self, agent: AgentState) -> float:
-        """Calculate average Manhattan distance to teammates"""
-        distances = []
-        for other in self.agents.values():
-            if other.agent_id != agent.agent_id and other.team == agent.team:
-                # Use Manhattan distance for grid
-                dist = abs(agent.x - other.x) + abs(agent.y - other.y)
-                distances.append(dist)
-        return np.mean(distances) if distances else 0.0
-
-    def _calculate_enemy_proximity(self, agent: AgentState) -> float:
-        """Calculate average Manhattan distance to nearest enemies (lower = closer)"""
-        enemy_distances = []
+    def _calculate_participation_reward(self, agent: AgentState) -> float:
+        """Reward agents based on their proximity to recent conversions"""
+        if not self.recent_conversions:
+            return 0.0
         
-        for other in self.agents.values():
-            if other.agent_id != agent.agent_id and other.team != agent.team:
-                # Use Manhattan distance for grid
-                dist = abs(agent.x - other.x) + abs(agent.y - other.y)
-                enemy_distances.append(dist)
+        participation_score = 0.0
+        # Iterate over all conversions that happened this step
+        for conversion_event in self.recent_conversions:
+            # Check if the agent is on the winning team of this specific conversion
+            if agent.team == self.agents[conversion_event['winner_id']].team:
+                conversion_pos = conversion_event['pos']
+                dist = abs(agent.x - conversion_pos[0]) + abs(agent.y - conversion_pos[1])
+                
+                # Give reward if within a certain radius
+                if dist <= 4:  # Engagement radius
+                    # Reward is higher for being closer
+                    participation_score += 1.0 / (dist + 1)
         
-        if not enemy_distances:
-            return self.grid_size * 2  # Max possible Manhattan distance
-        
-        # Return average distance to closest 3 enemies (or all if fewer than 3)
-        closest_enemies = sorted(enemy_distances)[:3]
-        return np.mean(closest_enemies)
-
-    def _calculate_contested_area_bonus(self, agent: AgentState, radius: int = 3) -> float:
-        """Calculate bonus for being in areas with multiple teams nearby"""
-        teams_nearby = set()
-        agents_in_radius = 0
-        
-        for other in self.agents.values():
-            if other.agent_id != agent.agent_id:
-                # Use Manhattan distance for grid
-                dist = abs(agent.x - other.x) + abs(agent.y - other.y)
-                if dist <= radius:
-                    teams_nearby.add(other.team)
-                    agents_in_radius += 1
-        
-        # Bonus increases with number of different teams nearby
-        team_diversity = len(teams_nearby)
-        density_factor = min(agents_in_radius / 5.0, 1.0)  # Cap at 5 agents
-        
-        return team_diversity * density_factor
+        # Scale the final reward
+        return participation_score * 0.1
         
     def render(self):
         """Render is handled separately in inference mode"""
         pass
+    
+    # You can now remove the unused reward helper functions if you want:
+    # _avg_teammate_distance, _calculate_enemy_proximity, _calculate_contested_area_bonus
 
 
 class CustomPPOModel(TorchModelV2, nn.Module):
