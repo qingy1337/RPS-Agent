@@ -212,37 +212,13 @@ class RPSBattleEnv(MultiAgentEnv):
         # Initialize rewards for all agents
         rewards = {agent_id: 0.0 for agent_id in self.agents.keys()}
         
-        # Check collisions and conversions
+        # Check collisions and conversions (this handles conversion penalties)
         self._handle_collisions(rewards)
-
+        
         # UPD1!
         updated_agent_teams = {agent_id: agent.team for agent_id, agent in self.agents.items()}
         
-        # Calculate team-based rewards
-        team_counts = self._count_teams()
-        total_agents = sum(team_counts.values())
-        
-        if total_agents > 0:
-            for agent_id, agent in self.agents.items():
-                # Reward for team dominance
-                rewards[agent_id] += 0.03 * (team_counts[agent.team] / total_agents)
-                
-                # Small penalty for being far from teammates
-                teammate_distance = self._avg_teammate_distance(agent)
-                if teammate_distance > 0:
-                    rewards[agent_id] -= 0.01 * teammate_distance / self.grid_size
-                
-                # Interaction incentive - reward for being near enemies
-                enemy_proximity = self._calculate_enemy_proximity(agent)
-
-                # UPD2!
-                rewards[agent_id] += 0.07 / (enemy_proximity / self.grid_size + 0.1)
-                
-                # Contested area bonus - reward for being in mixed team areas
-                contested_area_bonus = self._calculate_contested_area_bonus(agent)
-                rewards[agent_id] += contested_area_bonus * 0.05
-
-        # ----------------- Team Growth Reward ---------------------
+        # Team Growth Reward - reward for converting someone to your team
         team_counts = self._count_teams()
         total_agents = sum(team_counts.values())
         
